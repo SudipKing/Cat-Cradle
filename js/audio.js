@@ -176,7 +176,7 @@ window.CC = window.CC || {};
   }
 
   function eventSlot(fingerIndex) {
-    if (!ctx || ctx.state === 'closed') return false;
+    if (!ctx || ctx.state !== 'running' || audio.muted) return false;
     if (eventVoices >= MAX_EVENT_VOICES) return false;
     var t = ctx.currentTime;
     if (t - lastEventTime[fingerIndex] < 0.07) return false; // per-finger debounce
@@ -189,8 +189,35 @@ window.CC = window.CC || {};
     node.onended = function () { eventVoices = Math.max(0, eventVoices - 1); };
   }
 
+  var MUTE_KEY = 'cc-muted';
+  var suspendTimer = 0;
+
+  function readStoredMute() {
+    try { return localStorage.getItem(MUTE_KEY) === '1'; } catch (e) { return false; }
+  }
+
+  // Fade the master out, then suspend the whole context so nothing can keep sounding
+  // (a gain ramp alone can be lost if it is scheduled while the context is paused).
+  function applyMute() {
+    if (!ctx || !master) return;
+    clearTimeout(suspendTimer);
+    var g = master.gain, now = ctx.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    if (audio.muted) {
+      g.setTargetAtTime(0, now, 0.05);
+      suspendTimer = setTimeout(function () {
+        if (audio.muted && ctx.state === 'running') ctx.suspend();
+      }, 300);
+    } else {
+      var p = ctx.state === 'suspended' && ctx.resume ? ctx.resume() : null;
+      if (p && p.catch) p.catch(function () {});
+      g.setTargetAtTime(MASTER_LEVEL, now, 0.12);
+    }
+  }
+
   var audio = {
-    muted: false,
+    muted: readStoredMute(),
 
     init: function () {
       try {
@@ -199,9 +226,10 @@ window.CC = window.CC || {};
           if (!AC) return;
           ctx = new AC();
           buildGraph();
-          ramp(master.gain, audio.muted ? 0 : MASTER_LEVEL, 0.3);
+          applyMute();
+          return;
         }
-        if (ctx.state === 'suspended' && ctx.resume) {
+        if (!audio.muted && ctx.state === 'suspended' && ctx.resume) {
           var p = ctx.resume();
           if (p && p.catch) p.catch(function () {});
         }
@@ -212,12 +240,13 @@ window.CC = window.CC || {};
 
     setMuted: function (m) {
       audio.muted = !!m;
-      if (!ctx || !master) return;
-      ramp(master.gain, audio.muted ? 0 : MASTER_LEVEL, 0.12);
+      // Persist, and let other open tabs of the app pick it up through the storage event.
+      try { localStorage.setItem(MUTE_KEY, audio.muted ? '1' : '0'); } catch (e) {}
+      applyMute();
     },
 
     update: function (strings, dt) {
-      if (!ctx || !voices.length || !strings) return;
+      if (!ctx || !voices.length || !strings || audio.muted) return;
       var anyActive = false;
       for (var i = 0; i < 5; i++) {
         var s = strings[i];
@@ -345,6 +374,12 @@ window.CC = window.CC || {};
       } catch (e) { /* never throw into the render loop */ }
     }
   };
+
+  window.addEventListener('storage', function (e) {
+    if (e.key !== MUTE_KEY) return;
+    audio.muted = e.newValue === '1';
+    applyMute();
+  });
 
   window.CC.audio = audio;
 })();

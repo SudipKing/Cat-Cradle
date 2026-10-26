@@ -15,11 +15,15 @@ const STRAND_SAMPLES = 28;
 
 // Quality tiers, stepped automatically by the perf monitor. Model complexity 0 is MediaPipe's
 // fast/lite model; procW is the width of the downscaled frame fed to MediaPipe and drawn as background.
+// Visual effects go first (MED); the lite model and smaller frame track fast hands worse, so
+// they are the last resort (LOW).
 const TIERS = [
-  { name: 'LOW',  model: 0, procW: 320, blur: false, maxParticles: 250, burstN: 20 },
-  { name: 'MED',  model: 0, procW: 480, blur: true,  maxParticles: 450, burstN: 32 },
+  { name: 'LOW',  model: 0, procW: 480, blur: false, maxParticles: 250, burstN: 20 },
+  { name: 'MED',  model: 1, procW: 640, blur: false, maxParticles: 400, burstN: 30 },
   { name: 'HIGH', model: 1, procW: 640, blur: true,  maxParticles: 700, burstN: 46 },
 ];
+const HAND_HOLD_MS = 300;   // keep a hand that tracking briefly lost (fast motion) before fading it
+const FREEZE_DELAY_MS = 2400;
 const FPS_LOW = 24, FPS_HIGH = 45;
 const POOL_SIZE = TIERS[TIERS.length - 1].maxParticles;
 
@@ -29,9 +33,11 @@ let busy = false, modelReady = false, frameFresh = false, lastVideoTime = -1, pr
 let fit = { ox: 0, oy: 0, w: 1, h: 1 };
 let tierIdx = TIERS.length - 1;
 let sprites = [], overlayCanvas, bgCanvas, cleanMode = false;
+let freezeAt = 0, toastTimer = 0;
+let qualityLock = null; // null = auto, otherwise a TIERS index pinned with the Q key
 const perf = { frames: 0, acc: 0, fps: 60, lowSecs: 0, highSecs: 0, lastSwitch: 0, lastUp: 0, upBlockedUntil: 0 };
 
-const makeHand = () => ({ target: null, pts: null, presence: 0, depth: 0 });
+const makeHand = () => ({ target: null, pts: null, presence: 0, depth: 0, lastSeen: 0 });
 // L/R = local hands, RL/RR = remote partner's hands (multiplayer)
 const handState = { L: makeHand(), R: makeHand(), RL: makeHand(), RR: makeHand() };
 
@@ -168,26 +174,58 @@ function windowResized() {
   CC.sculpture?.resize(width, height);
 }
 
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 1400);
+}
+
+const layerText = n => `${n} layer${n === 1 ? '' : 's'}`;
+
 function keyPressed() {
   if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
   const k = key.toLowerCase();
-  if (key === ' ') { freezeSculpture(); return false; }
-  if (k === 'z' || keyCode === BACKSPACE) {
-    CC.sculpture?.undo(); CC.net?.sendEvent('undo');
+  const sc = CC.sculpture;
+  if (key === ' ') {
+    // A countdown, because one person can't hold both hands up and press Space at the same time.
+    if (!sc) toast('Sculpture unavailable');
+    else if (freezeAt) { freezeAt = 0; toast('Freeze cancelled'); }
+    else freezeAt = performance.now() + FREEZE_DELAY_MS;
     return false;
   }
-  if (k === 'x') { CC.sculpture?.clear(); CC.net?.sendEvent('clear'); }
+  if (k === 'z' || keyCode === BACKSPACE) {
+    if (sc && sc.count > 0) { sc.undo(); CC.net?.sendEvent('undo'); toast(`Undo · ${layerText(sc.count)}`); }
+    else toast('Nothing to undo');
+    updateHud();
+    return false;
+  }
+  if (k === 'x') {
+    if (sc && sc.count > 0) { sc.clear(); CC.net?.sendEvent('clear'); toast('Sculpture cleared'); }
+    else toast('Nothing to clear');
+  }
+  else if (k === 'q') {
+    // AUTO -> HIGH -> MED -> LOW -> AUTO
+    qualityLock = qualityLock === null ? TIERS.length - 1 : qualityLock === 0 ? null : qualityLock - 1;
+    if (qualityLock !== null) setTier(qualityLock);
+    toast(qualityLock === null ? 'Quality: auto' : `Quality locked: ${TIERS[qualityLock].name}`);
+  }
   else if (k === 'c') cleanMode = !cleanMode;
   else if (k === 'h') $('hud').classList.toggle('hidden');
   else if (k === 'm') CC.net?.togglePanel();
-  else if (k === 's' && CC.audio) { CC.audio.init(); CC.audio.setMuted(!CC.audio.muted); }
+  else if (k === 's' && CC.audio) {
+    CC.audio.init();
+    CC.audio.setMuted(!CC.audio.muted);
+    toast(CC.audio.muted ? 'Sound muted' : 'Sound on');
+  }
   updateHud();
 }
 
 function updateHud() {
   const t = TIERS[tierIdx];
   $('fps').textContent = Math.round(perf.fps);
-  $('quality').textContent = `${t.name} (model ${t.model}, ${t.procW}px)`;
+  $('quality').textContent = `${t.name}${qualityLock === null ? ' auto' : ' locked'} (model ${t.model}, ${t.procW}px)`;
   $('mode').textContent = cleanMode ? 'CLEAN/CRT' : 'CAMERA';
   $('sound').textContent = !CC.audio ? 'n/a' : CC.audio.muted ? 'muted' : 'on';
   $('link').textContent = CC.net ? (CC.net.roomCode ? `${CC.net.status} ${CC.net.roomCode}` : CC.net.status) : 'n/a';
@@ -200,7 +238,7 @@ function monitorPerf(dtMs) {
   if (perf.acc < 1000) return;
   perf.fps = perf.frames * 1000 / perf.acc;
   perf.frames = 0; perf.acc = 0;
-  if (!modelReady || document.hidden) return;
+  if (!modelReady || document.hidden || qualityLock !== null) return;
 
   if (perf.fps < FPS_LOW) { perf.lowSecs++; perf.highSecs = 0; }
   else if (perf.fps > FPS_HIGH) { perf.highSecs++; perf.lowSecs = 0; }
@@ -268,16 +306,30 @@ function onResults(res) {
   const lms = res.multiHandLandmarks || [], hd = res.multiHandedness || [];
   // Mirror x so landmarks match the mirrored display. Coordinates stay normalized (0..1 of the video frame).
   const found = lms.map((pts, i) => ({ pts: pts.map(p => ({ x: 1 - p.x, y: p.y, z: p.z })), label: hd[i] && hd[i].label }));
+  const hL = handState.L, hR = handState.R;
   let L = null, R = null;
   if (found.length >= 2) {
     found.sort((a, b) => a.pts[0].x - b.pts[0].x);
     L = found[0]; R = found[1];
   } else if (found.length === 1) {
-    // MediaPipe labels assume a mirrored input; ours is raw, so "Right" is the user's left hand.
-    if (found[0].label === 'Right') L = found[0]; else R = found[0];
+    const w = found[0].pts[0];
+    if (hL.target && hR.target) {
+      // Both hands were just tracked: the survivor is whichever one it is closest to.
+      const dL = Math.hypot(w.x - hL.target[0].x, w.y - hL.target[0].y);
+      const dR = Math.hypot(w.x - hR.target[0].x, w.y - hR.target[0].y);
+      if (dL < dR) L = found[0]; else R = found[0];
+    } else if (found[0].label === 'Right') {
+      // MediaPipe labels assume a mirrored input; ours is raw, so "Right" is the user's left hand.
+      L = found[0];
+    } else R = found[0];
   }
-  handState.L.target = L ? L.pts : null;
-  handState.R.target = R ? R.pts : null;
+  // Fast motion makes MediaPipe drop a hand for a few frames. Hold its last pose briefly so the
+  // strings stay attached instead of snapping off.
+  const now = performance.now();
+  for (const [h, f] of [[hL, L], [hR, R]]) {
+    if (f) { h.target = f.pts; h.lastSeen = now; }
+    else if (now - h.lastSeen > HAND_HOLD_MS) h.target = null;
+  }
   $('handCount').textContent = found.length;
 }
 
@@ -361,6 +413,8 @@ function draw() {
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
   ctx.shadowBlur = 0;
+  if (freezeAt) drawFreezeCountdown();
+  ctx.globalAlpha = 1;
   if (cleanMode) drawCRT(t);
   else { ctx.globalAlpha = 0.6; ctx.drawImage(overlayCanvas, 0, 0); ctx.globalAlpha = 1; }
 }
@@ -535,11 +589,30 @@ function freezeSculpture() {
   if (!CC.sculpture) return;
   const strands = [];
   for (const set of Object.values(springs)) for (const s of set) if (s.drawn) strands.push(sampleStrand(s));
-  if (!strands.length) return;
+  if (!strands.length) { toast('Show both hands to freeze'); return; }
   CC.sculpture.freeze(strands);
   for (let i = 0; i < Math.min(5, strands.length); i++) CC.audio?.pluck(i, 0.7);
   CC.net?.sendEvent('freeze', { strands: strands.map(toNorm) });
+  toast(`Frozen · ${layerText(CC.sculpture.count)}`);
   updateHud();
+}
+
+function drawFreezeCountdown() {
+  const left = freezeAt - performance.now();
+  if (left <= 0) { freezeAt = 0; freezeSculpture(); return; }
+  const n = Math.ceil(left / (FREEZE_DELAY_MS / 3));
+  const frac = (left % (FREEZE_DELAY_MS / 3)) / (FREEZE_DELAY_MS / 3);
+  ctx.globalAlpha = 0.35 + 0.65 * frac;
+  ctx.font = `bold ${Math.round(Math.min(width, height) * 0.18)}px Consolas, monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = '#00f0ff';
+  ctx.shadowBlur = 30;
+  ctx.fillText(n, width / 2, height / 2);
+  ctx.shadowBlur = 0;
+  ctx.font = '14px Consolas, monospace';
+  ctx.fillText('HOLD YOUR STRINGS · SPACE TO CANCEL', width / 2, height / 2 + Math.min(width, height) * 0.13);
 }
 
 // ---------- Particles ----------
