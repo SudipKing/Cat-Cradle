@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Cat's Cradle</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #02040f; color: #cfefff;
+    font-family: "Consolas", "SF Mono", "Menlo", monospace; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 14px; left: 16px; font-size: 12px; letter-spacing: .08em; line-height: 1.7;
+    padding: 10px 14px; border: 1px solid rgba(0, 240, 255, .35); border-radius: 6px;
+    background: rgba(2, 6, 20, .55); backdrop-filter: blur(4px); text-shadow: 0 0 6px rgba(0, 240, 255, .8);
+    pointer-events: none; transition: opacity .3s; }
+  #hud.hidden { opacity: 0; }
+  #hud b { color: #ff2bd6; text-shadow: 0 0 6px rgba(255, 43, 214, .9); font-weight: normal; }
+  #hud .k { color: #ffe600; text-shadow: 0 0 6px rgba(255, 230, 0, .8); }
+  #msg { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+    font-size: 15px; letter-spacing: .15em; color: #00f0ff; text-shadow: 0 0 10px #00f0ff; pointer-events: none; padding: 16px; }
+  #msg.hidden { display: none; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="hud">
+  <div><b>NEON CAT'S CRADLE</b></div>
+  <div>STATUS <span id="status">starting camera…</span></div>
+  <div>HANDS <span id="handCount">0</span> · FPS <span id="fps">–</span> · MODE <span id="mode">CAMERA</span></div>
+  <div><span class="k">[C]</span> clean / CRT mode · <span class="k">[H]</span> hide HUD</div>
+  <div>Touch matching fingertips together to burst.</div>
+</div>
+<div id="msg">INITIALIZING…</div>
+
+<script>
+// ---------- Config ----------
+const MP_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240';
+const TIPS = [4, 8, 12, 16, 20];
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const PALM = [0, 1, 5, 9, 13, 17];
+const PALETTE = [[0, 240, 255], [255, 43, 214], [255, 230, 0]]; // cyan, magenta, yellow
+const SPRITE_STEPS = 24;
+const MAX_PARTICLES = 700;
+
+// ---------- State ----------
+let video, hands, ctx;
+let busy = false, modelReady = false;
+let fit = { ox: 0, oy: 0, w: 1, h: 1 };
+const handState = { L: { target: null, pts: null, presence: 0 }, R: { target: null, pts: null, presence: 0 } };
+const strings = TIPS.map(() => ({ init: false, mx: 0, my: 0, vx: 0, vy: 0, rest: 0, touching: false, lastBurst: 0 }));
+const particles = [];
+let sprites = [], overlayCanvas, bgCanvas, cleanMode = false;
+const $ = id => document.getElementById(id);
+
+// ---------- Color helpers ----------
+function paletteAt(u) {
+  u = ((u % 1) + 1) % 1;
+  const f = u * PALETTE.length, i = Math.floor(f), t = f - i;
+  const a = PALETTE[i], b = PALETTE[(i + 1) % PALETTE.length];
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+
+// Pre-rendered glow sprites: drawImage is far cheaper than shadowBlur per dot/particle.
+function buildSprites() {
+  sprites = [];
+  for (let i = 0; i < SPRITE_STEPS; i++) {
+    const c = paletteAt(i / SPRITE_STEPS), s = 64, cv = document.createElement('canvas');
+    cv.width = cv.height = s;
+    const g = cv.getContext('2d'), grad = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.12, rgba(c, 1));
+    grad.addColorStop(0.35, rgba(c, 0.35));
+    grad.addColorStop(1, rgba(c, 0));
+    g.fillStyle = grad;
+    g.fillRect(0, 0, s, s);
+    sprites.push(cv);
+  }
+}
+const spriteFor = u => sprites[Math.floor((((u % 1) + 1) % 1) * SPRITE_STEPS) % SPRITE_STEPS];
+
+// Static layers rebuilt only on resize: CRT scanlines + vignette, and the midnight background.
+function buildLayers() {
+  const W = width, H = height;
+  overlayCanvas = document.createElement('canvas');
+  overlayCanvas.width = W; overlayCanvas.height = H;
+  let g = overlayCanvas.getContext('2d');
+  g.fillStyle = 'rgba(0,0,0,0.22)';
+  for (let y = 0; y < H; y += 3) g.fillRect(0, y, W, 1);
+  let v = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.hypot(W, H) * 0.6);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.65)');
+  g.fillStyle = v;
+  g.fillRect(0, 0, W, H);
+
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width = W; bgCanvas.height = H;
+  g = bgCanvas.getContext('2d');
+  const bg = g.createRadialGradient(W / 2, H * 0.45, 0, W / 2, H / 2, Math.hypot(W, H) * 0.6);
+  bg.addColorStop(0, '#0c1a4a');
+  bg.addColorStop(1, '#02040f');
+  g.fillStyle = bg;
+  g.fillRect(0, 0, W, H);
+  g.strokeStyle = 'rgba(0,240,255,0.045)';
+  g.lineWidth = 1;
+  for (let x = 0; x < W; x += 48) { g.beginPath(); g.moveTo(x + .5, 0); g.lineTo(x + .5, H); g.stroke(); }
+  for (let y = 0; y < H; y += 48) { g.beginPath(); g.moveTo(0, y + .5); g.lineTo(W, y + .5); g.stroke(); }
+}
+
+// ---------- p5 lifecycle ----------
+function setup() {
+  pixelDensity(1);
+  createCanvas(windowWidth, windowHeight);
+  ctx = drawingContext;
+  buildSprites();
+  buildLayers();
+
+  video = createCapture({ video: { width: 1280, height: 720, facingMode: 'user' }, audio: false }, () => {
+    $('status').textContent = 'loading hand model…';
+    $('msg').textContent = 'LOADING HAND MODEL…';
+  });
+  video.elt.setAttribute('playsinline', '');
+  video.elt.muted = true;
+  video.hide();
+
+  hands = new Hands({ locateFile: f => `${MP_URL}/${f}` });
+  hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+  hands.onResults(onResults);
+
+  // Surface camera permission failures (p5 swallows them).
+  navigator.mediaDevices?.getUserMedia({ video: true }).then(s => s.getTracks().forEach(t => t.stop()))
+    .catch(err => {
+      $('status').textContent = 'camera unavailable';
+      $('msg').classList.remove('hidden');
+      $('msg').textContent = `CAMERA ERROR: ${err.name}. Allow camera access (and serve over https or localhost).`;
+    });
+
+  setInterval(() => { $('fps').textContent = Math.round(frameRate()); }, 500);
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  buildLayers();
+}
+
+function keyPressed() {
+  if (key === 'c' || key === 'C') {
+    cleanMode = !cleanMode;
+    $('mode').textContent = cleanMode ? 'CLEAN/CRT' : 'CAMERA';
+  } else if (key === 'h' || key === 'H') {
+    $('hud').classList.toggle('hidden');
+  }
+}
+
+function updateFit() {
+  const vw = video.elt.videoWidth, vh = video.elt.videoHeight;
+  if (!vw) return false;
+  const s = Math.max(width / vw, height / vh); // "cover" fit
+  fit.w = vw * s; fit.h = vh * s;
+  fit.ox = (width - fit.w) / 2; fit.oy = (height - fit.h) / 2;
+  return true;
+}
+
+// Fire-and-forget detection: never block rendering waiting on the model.
+function pumpDetection() {
+  if (busy || video.elt.readyState < 2) return;
+  busy = true;
+  hands.send({ image: video.elt }).catch(e => console.error(e)).finally(() => { busy = false; });
+}
+
+function onResults(res) {
+  if (!modelReady) {
+    modelReady = true;
+    $('status').textContent = 'tracking';
+    $('msg').classList.add('hidden');
+  }
+  const lms = res.multiHandLandmarks || [], hd = res.multiHandedness || [];
+  // Mirror x so landmarks match the mirrored display.
+  const found = lms.map((pts, i) => ({ pts: pts.map(p => ({ x: 1 - p.x, y: p.y })), label: hd[i] && hd[i].label }));
+  let L = null, R = null;
+  if (found.length >= 2) {
+    found.sort((a, b) => a.pts[0].x - b.pts[0].x);
+    L = found[0]; R = found[1];
+  } else if (found.length === 1) {
+    // MediaPipe labels assume a mirrored input; ours is raw, so "Right" is the user's left hand.
+    if (found[0].label === 'Right') L = found[0]; else R = found[0];
+  }
+  handState.L.target = L ? L.pts : null;
+  handState.R.target = R ? R.pts : null;
+  $('handCount').textContent = found.length;
+}
+
+function draw() {
+  const hasVideo = updateFit();
+  if (hasVideo) pumpDetection();
+
+  // Background
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
+  if (cleanMode || !hasVideo) {
+    ctx.drawImage(bgCanvas, 0, 0);
+  } else {
+    ctx.save();
+    ctx.translate(width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video.elt, fit.ox, fit.oy, fit.w, fit.h);
+    ctx.restore();
+    ctx.fillStyle = 'rgba(2,4,16,0.6)'; // darken for the futuristic look and neon contrast
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  updateHands();
+
+  ctx.globalCompositeOperation = 'lighter'; // additive blending = free extra glow
+  const t = millis() / 1000;
+  if (cleanMode) { drawSilhouette(handState.L); drawSilhouette(handState.R); }
+  drawSkeleton(handState.L, t);
+  drawSkeleton(handState.R, t);
+  drawStrings(t);
+  updateParticles();
+  drawJoints(handState.L, t);
+  drawJoints(handState.R, t);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
+  if (cleanMode) drawCRT(t);
+  else { ctx.globalAlpha = 0.6; ctx.drawImage(overlayCanvas, 0, 0); ctx.globalAlpha = 1; }
+}
+
+// ---------- Hands ----------
+function updateHands() {
+  for (const h of [handState.L, handState.R]) {
+    if (h.target) {
+      const screen = h.target.map(p => ({ x: fit.ox + p.x * fit.w, y: fit.oy + p.y * fit.h }));
+      if (!h.pts) h.pts = screen;
+      else for (let i = 0; i < 21; i++) {           // smooth jitter between detections
+        h.pts[i].x += (screen[i].x - h.pts[i].x) * 0.5;
+        h.pts[i].y += (screen[i].y - h.pts[i].y) * 0.5;
+      }
+      h.presence = Math.min(1, h.presence + 0.15);
+    } else if (h.pts) {
+      h.presence -= 0.08;
+      if (h.presence <= 0) { h.presence = 0; h.pts = null; }
+    }
+  }
+}
+
+function drawSilhouette(h) {
+  if (!h.pts) return;
+  const p = h.pts, scale = Math.hypot(p[0].x - p[9].x, p[0].y - p[9].y);
+  ctx.globalAlpha = 0.16 * h.presence;
+  ctx.strokeStyle = ctx.fillStyle = 'rgb(40,90,200)';
+  ctx.lineCap = ctx.lineJoin = 'round';
+  ctx.lineWidth = scale * 0.32;
+  ctx.beginPath();
+  for (const [a, b] of BONES) { ctx.moveTo(p[a].x, p[a].y); ctx.lineTo(p[b].x, p[b].y); }
+  ctx.stroke();
+  ctx.beginPath();
+  PALM.forEach((i, k) => k ? ctx.lineTo(p[i].x, p[i].y) : ctx.moveTo(p[i].x, p[i].y));
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+}
+
+function drawSkeleton(h, t) {
+  if (!h.pts) return;
+  const p = h.pts;
+  ctx.globalAlpha = 0.35 * h.presence;
+  ctx.strokeStyle = rgba(paletteAt(t * 0.05), 1);
+  ctx.lineWidth = 1.2;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (const [a, b] of BONES) { ctx.moveTo(p[a].x, p[a].y); ctx.lineTo(p[b].x, p[b].y); }
+  ctx.stroke();
+}
+
+function drawJoints(h, t) {
+  if (!h.pts) return;
+  ctx.globalAlpha = h.presence;
+  for (let j = 0; j < 21; j++) {
+    const finger = j === 0 ? 0 : Math.floor((j - 1) / 4);
+    const isTip = TIPS.includes(j);
+    const size = (isTip ? 38 : 22) * (0.9 + 0.1 * Math.sin(t * 6 + j));
+    ctx.drawImage(spriteFor(finger / 5 + t * 0.08), h.pts[j].x - size / 2, h.pts[j].y - size / 2, size, size);
+  }
+}
+
+// ---------- Elastic strings ----------
+function drawStrings(t) {
+  const L = handState.L, R = handState.R;
+  const active = L.pts && R.pts;
+  const diag = Math.hypot(width, height);
+  for (let i = 0; i < TIPS.length; i++) {
+    const s = strings[i];
+    if (!active) { s.init = false; s.touching = false; continue; }
+    const a = L.pts[TIPS[i]], b = R.pts[TIPS[i]];
+    const d = Math.hypot(b.x - a.x, b.y - a.y);
+    const midX = (a.x + b.x) / 2, midY = (a.y + b.y) / 2;
+    if (!s.init) { s.init = true; s.mx = midX; s.my = midY; s.vx = s.vy = 0; s.rest = d; }
+
+    // Rest length lags behind actual distance: pulling apart = taut, pushing together = slack + sag.
+    s.rest += (d - s.rest) * 0.03;
+    const slack = Math.max(0, s.rest - d);
+    const tension = Math.min(1, d / (diag * 0.55));
+    const sag = 8 + slack * 0.7 + (1 - tension) * 18;
+
+    // Damped spring on the string's midpoint gives the wobbly, elastic overshoot.
+    s.vx += (midX - s.mx) * 0.2;
+    s.vy += (midY + sag - s.my) * 0.2;
+    s.vx *= 0.78; s.vy *= 0.78;
+    s.mx += s.vx; s.my += s.vy;
+    // Quadratic control point so the curve passes through the spring midpoint.
+    const cx = 2 * s.mx - midX, cy = 2 * s.my - midY;
+
+    // Farther apart -> thinner and hotter (cyan -> magenta -> yellow).
+    const w = 4.2 - tension * 3.2;
+    const shift = tension * 0.66 + i * 0.04 + t * 0.06;
+    const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+    grad.addColorStop(0, rgba(paletteAt(shift)));
+    grad.addColorStop(0.5, rgba(paletteAt(shift + 0.33)));
+    grad.addColorStop(1, rgba(paletteAt(shift + 0.66)));
+    const alpha = Math.min(L.presence, R.presence);
+
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.quadraticCurveTo(cx, cy, b.x, b.y);
+    // Pass 1: wide soft halo (cheap, no shadow)
+    ctx.strokeStyle = grad;
+    ctx.globalAlpha = 0.18 * alpha;
+    ctx.lineWidth = w * 5;
+    ctx.stroke();
+    // Pass 2: glowing body with shadowBlur
+    ctx.globalAlpha = 0.9 * alpha;
+    ctx.lineWidth = w;
+    ctx.shadowColor = rgba(paletteAt(shift + 0.33));
+    ctx.shadowBlur = 14 + tension * 10;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    // Pass 3: hot white core for a laser look
+    ctx.globalAlpha = 0.7 * alpha;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = Math.max(0.6, w * 0.3);
+    ctx.stroke();
+
+    // Fingertip contact -> particle burst (edge-triggered with cooldown).
+    const touching = d < diag * 0.03;
+    const now = millis();
+    if (touching && !s.touching && now - s.lastBurst > 300) {
+      burst(midX, midY, i / 5);
+      s.lastBurst = now;
+    }
+    s.touching = touching;
+  }
+}
+
+// ---------- Particles ----------
+function burst(x, y, hue) {
+  const n = 46;
+  for (let k = 0; k < n && particles.length < MAX_PARTICLES; k++) {
+    const ang = Math.random() * Math.PI * 2, sp = 2 + Math.random() * 9;
+    particles.push({ x, y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp,
+      life: 1, decay: 0.012 + Math.random() * 0.025, u: hue + Math.random() * 0.6, size: 10 + Math.random() * 22 });
+  }
+  particles.push({ ring: true, x, y, r: 4, life: 1, u: hue });
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= p.ring ? 0.04 : p.decay;
+    if (p.life <= 0) { particles[i] = particles[particles.length - 1]; particles.pop(); continue; }
+    if (p.ring) {
+      p.r += 7;
+      ctx.globalAlpha = p.life * 0.8;
+      ctx.strokeStyle = rgba(paletteAt(p.u));
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.stroke();
+      continue;
+    }
+    p.vx *= 0.95; p.vy = p.vy * 0.95 + 0.06;
+    p.x += p.vx; p.y += p.vy;
+    const s = p.size * p.life;
+    ctx.globalAlpha = p.life;
+    ctx.drawImage(spriteFor(p.u), p.x - s / 2, p.y - s / 2, s, s);
+  }
+}
+
+// ---------- CRT overlay ----------
+function drawCRT(t) {
+  ctx.globalAlpha = 0.92 + Math.random() * 0.08; // faint flicker
+  ctx.drawImage(overlayCanvas, 0, 0);
+  // Slow rolling bright band
+  const y = ((t * 0.12) % 1.2 - 0.1) * height;
+  const g = ctx.createLinearGradient(0, y - 60, 0, y + 60);
+  g.addColorStop(0, 'rgba(120,200,255,0)');
+  g.addColorStop(0.5, 'rgba(120,200,255,0.05)');
+  g.addColorStop(1, 'rgba(120,200,255,0)');
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = g;
+  ctx.fillRect(0, y - 60, width, 120);
+}
+</script>
+</body>
+</html>
