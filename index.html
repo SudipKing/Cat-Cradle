@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Cat's Cradle</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #02040f; color: #cfefff;
+    font-family: "Consolas", "SF Mono", "Menlo", monospace; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 14px; left: 16px; max-width: calc(100vw - 64px); font-size: 12px; letter-spacing: .08em; line-height: 1.7;
+    padding: 10px 14px; border: 1px solid rgba(0, 240, 255, .35); border-radius: 6px;
+    background: rgba(2, 6, 20, .55); backdrop-filter: blur(4px); text-shadow: 0 0 6px rgba(0, 240, 255, .8);
+    pointer-events: none; transition: opacity .3s; }
+  #hud.hidden { opacity: 0; }
+  #hud b { color: #ff2bd6; text-shadow: 0 0 6px rgba(255, 43, 214, .9); font-weight: normal; }
+  #hud .k { color: #ffe600; text-shadow: 0 0 6px rgba(255, 230, 0, .8); }
+  #hud .dim { opacity: .7; }
+  #msg { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+    font-size: 15px; letter-spacing: .15em; color: #00f0ff; text-shadow: 0 0 10px #00f0ff; pointer-events: none; padding: 16px; }
+  #msg.hidden { display: none; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/sculpture.js"></script>
+<script src="js/multiplayer.js"></script>
+<script src="js/core.js"></script>
+</head>
+<body>
+<div id="hud">
+  <div><b>NEON CAT'S CRADLE</b></div>
+  <div>STATUS <span id="status">starting camera…</span> · HANDS <span id="handCount">0</span> · FPS <span id="fps">–</span></div>
+  <div>QUALITY <span id="quality">–</span> · MODE <span id="mode">CAMERA</span></div>
+  <div>SOUND <span id="sound">–</span> · LINK <span id="link">–</span> · LAYERS <span id="layers">0</span></div>
+  <div><span class="k">[SPACE]</span> freeze · <span class="k">[Z]</span> undo · <span class="k">[X]</span> clear · <span class="k">[S]</span> sound</div>
+  <div><span class="k">[M]</span> multiplayer · <span class="k">[C]</span> clean/CRT · <span class="k">[H]</span> hide HUD</div>
+  <div class="dim">Touch matching fingertips to burst. Click once to enable sound.</div>
+</div>
+<div id="msg">INITIALIZING…</div>
+</body>
+</html>
